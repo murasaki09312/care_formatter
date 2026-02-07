@@ -5,11 +5,11 @@ class LlmClient
   ENDPOINT = ENV.fetch('LLM_ENDPOINT', 'https://api.openai.com/v1/chat/completions').freeze
   DEFAULT_MODEL = ENV.fetch('LLM_MODEL', 'gpt-4o-mini').freeze
 
-  def format(text:, mode:, tone:, system_prompt:)
+  def format(text:, mode:, tone:, system_prompt:, model_name:)
     return nil if api_key.to_s.strip.empty?
 
     request_body = {
-      model: model,
+      model: model_name.presence || model,
       temperature: 0.2,
       messages: [
         { role: 'system', content: system_prompt },

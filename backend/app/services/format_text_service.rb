@@ -20,14 +20,15 @@ class FormatTextService
   VALID_MODES = %w[handover summary family].freeze
   VALID_TONES = %w[objective warm].freeze
 
-  def self.call(text:, mode:, tone:)
-    new(text: text, mode: mode, tone: tone).call
+  def self.call(text:, mode:, tone:, model_name:)
+    new(text: text, mode: mode, tone: tone, model_name: model_name).call
   end
 
-  def initialize(text:, mode:, tone:)
+  def initialize(text:, mode:, tone:, model_name:)
     @text = text.to_s
     @mode = mode.to_s
     @tone = tone.to_s
+    @model_name = model_name.to_s
   end
 
   def call
@@ -37,7 +38,8 @@ class FormatTextService
       text: text,
       mode: mode,
       tone: tone,
-      system_prompt: llm_system_prompt
+      system_prompt: llm_system_prompt,
+      model_name: model_name
     )
 
     if llm_payload
@@ -49,7 +51,7 @@ class FormatTextService
 
   private
 
-  attr_reader :text, :mode, :tone
+  attr_reader :text, :mode, :tone, :model_name
 
   def llm_client
     @llm_client ||= LlmClient.new
