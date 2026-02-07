@@ -1,37 +1,35 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import { useRouter } from 'next/navigation';
+import { ApiError, apiRequest } from '@/lib/api';
+import { clearToken, getToken } from '@/lib/auth';
+import { BillingMeResponse, FormatResponse, LimitStats, Mode, Tone } from '@/lib/types';
+import LoggedInHeader from '@/components/logged-in-header';
 
-type Mode = 'handover' | 'summary' | 'family';
-type Tone = 'objective' | 'warm';
-
-type FormatResponse = {
-  result: string;
-  meta: {
-    mode: Mode;
-    tone: Tone;
-    category_order: string[];
-    used_llm: boolean;
-  };
+const MODE_LABELS: Record<Mode, string> = {
+  handover: '申し送り',
+  summary: '要約',
+  family: '家族向け'
 };
 
-const DEFAULT_API_BASE = 'http://localhost:3001';
-const REQUEST_TIMEOUT_MS = 15000;
+const TONE_LABELS: Record<Tone, string> = {
+  objective: '客観',
+  warm: '温かみ'
+};
 
 export default function HomePage() {
+  const router = useRouter();
   const [text, setText] = useState('');
   const [mode, setMode] = useState<Mode>('handover');
   const [tone, setTone] = useState<Tone>('objective');
   const [result, setResult] = useState('');
-  const [usedLlm, setUsedLlm] = useState<boolean | null>(null);
+  const [meta, setMeta] = useState<FormatResponse['meta'] | null>(null);
+  const [limits, setLimits] = useState<LimitStats | null>(null);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  const [initialLoading, setInitialLoading] = useState(true);
   const [copied, setCopied] = useState(false);
-
-  const apiBaseUrl = useMemo(
-    () => process.env.NEXT_PUBLIC_API_BASE_URL || DEFAULT_API_BASE,
-    []
-  );
 
   useEffect(() => {
     const savedTone = window.localStorage.getItem('care_formatter_tone');
@@ -44,7 +42,35 @@ export default function HomePage() {
     window.localStorage.setItem('care_formatter_tone', tone);
   }, [tone]);
 
-  const canSubmit = text.trim().length > 0 && !loading;
+  useEffect(() => {
+    const token = getToken();
+    if (!token) {
+      router.replace('/login');
+      return;
+    }
+
+    const fetchBilling = async () => {
+      try {
+        const billing = await apiRequest<BillingMeResponse>('/api/v1/billing/me');
+        setLimits(billing.limits);
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 401) {
+          clearToken();
+          router.replace('/login');
+          return;
+        }
+        setError(e instanceof ApiError ? e.message : '利用情報の取得に失敗しました');
+      } finally {
+        setInitialLoading(false);
+      }
+    };
+
+    void fetchBilling();
+  }, [router]);
+
+  const maxInputChars = limits?.max_input_chars ?? 1000;
+  const isTooLong = text.length > maxInputChars;
+  const canSubmit = text.trim().length > 0 && !loading && !isTooLong;
 
   const runFormat = async () => {
     if (!canSubmit) return;
@@ -52,39 +78,41 @@ export default function HomePage() {
     setLoading(true);
     setError('');
 
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
-
     try {
-      const response = await fetch(`${apiBaseUrl}/api/v1/format`, {
+      const response = await apiRequest<FormatResponse>('/api/v1/format', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ text, mode, tone }),
-        signal: controller.signal
+        body: { text, mode, tone }
       });
 
-      const payload = (await response.json()) as FormatResponse | { error: string };
+      setResult(response.result);
+      setMeta(response.meta);
+      setLimits({
+        plan: response.meta.plan,
+        monthly_used: response.meta.monthly_used,
+        monthly_limit: response.meta.monthly_limit,
+        remaining: response.meta.remaining,
+        max_input_chars: response.meta.max_input_chars,
+        model_name: response.meta.model_name
+      });
+    } catch (e) {
+      if (e instanceof ApiError) {
+        if (e.status === 401) {
+          clearToken();
+          router.push('/login');
+          return;
+        }
 
-      if (!response.ok) {
-        const message = 'error' in payload ? payload.error : 'API request failed';
-        throw new Error(message);
-      }
-
-      if (!('result' in payload)) {
-        throw new Error('Invalid API response');
-      }
-
-      setResult(payload.result);
-      setUsedLlm(payload.meta.used_llm);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : 'Unknown error';
-      if (message === 'The operation was aborted.') {
-        setError('タイムアウトしました。時間をおいて再実行してください。');
+        if (e.errorCode === 'MONTHLY_LIMIT_EXCEEDED') {
+          setError('今月の回数上限に達しました。プラン変更 or 来月まで待つ');
+        } else if (e.errorCode === 'TEXT_TOO_LONG') {
+          setError('文字数上限を超えています。分割してください');
+        } else {
+          setError(e.message);
+        }
       } else {
-        setError(message);
+        setError('整形に失敗しました');
       }
     } finally {
-      clearTimeout(timer);
       setLoading(false);
     }
   };
@@ -101,25 +129,42 @@ export default function HomePage() {
     }
   };
 
+  const usageSummary = useMemo(() => {
+    if (!limits) return '-';
+    return `${limits.monthly_used}/${limits.monthly_limit} (残り ${limits.remaining})`;
+  }, [limits]);
+
+  if (initialLoading) {
+    return (
+      <main className="mx-auto max-w-6xl p-4 md:p-8">
+        <section className="rounded-3xl border border-slate-200 bg-white p-6 shadow-card">
+          <p className="text-sm text-slate-600">読み込み中...</p>
+        </section>
+      </main>
+    );
+  }
+
   return (
     <main className="mx-auto max-w-6xl p-4 md:p-8">
-      <section className="mb-8 rounded-3xl border border-slate-200 bg-white/85 p-6 shadow-card backdrop-blur">
-        <p className="text-sm font-medium text-brand-700">Care Formatter</p>
-        <h1 className="mt-2 text-2xl font-bold tracking-tight text-slate-900 md:text-3xl">
-          介護記録 整形/要約ツール
-        </h1>
-        <p className="mt-2 text-sm text-slate-600">
-          Rails APIへ送信して、申し送り・要約・家族向け文章を生成します。
-        </p>
+      <LoggedInHeader
+        eyebrow="Care Formatter"
+        title="介護記録 整形/要約ツール"
+        description="ログイン中プランに応じて利用回数と文字数上限を自動適用します。"
+        links={[{ href: '/account', label: 'アカウント' }]}
+      />
+      <section className="mb-8 rounded-3xl border border-slate-200 bg-white p-4 text-xs text-slate-600 shadow-card">
+        <div className="grid gap-2 md:grid-cols-3">
+          <p>現在プラン: <span className="font-semibold uppercase">{limits?.plan || 'basic'}</span></p>
+          <p>利用回数: <span className="font-semibold">{usageSummary}</span></p>
+          <p>入力上限: <span className="font-semibold">{maxInputChars}文字</span></p>
+        </div>
       </section>
 
       <section className="grid gap-6 lg:grid-cols-2">
         <article className="rounded-3xl border border-slate-200 bg-white p-5 shadow-card md:p-6">
           <h2 className="text-lg font-semibold text-slate-900">入力</h2>
 
-          <label className="mt-4 block text-sm font-medium text-slate-700" htmlFor="record-text">
-            記録テキスト
-          </label>
+          <label className="mt-4 block text-sm font-medium text-slate-700" htmlFor="record-text">記録テキスト</label>
           <textarea
             id="record-text"
             value={text}
@@ -128,6 +173,7 @@ export default function HomePage() {
             placeholder="例: 9時10分に体温36.5、血圧128/74。昼食は主菜8割摂取。14時にトイレ誘導し排尿あり。"
             className="mt-2 w-full resize-y rounded-2xl border border-slate-300 px-4 py-3 text-sm outline-none ring-brand-500 transition focus:ring-2"
           />
+          <p className={`mt-2 text-xs ${isTooLong ? 'text-red-600' : 'text-slate-500'}`}>{text.length}/{maxInputChars}</p>
 
           <div className="mt-5 grid gap-5 sm:grid-cols-2">
             <fieldset>
@@ -143,7 +189,7 @@ export default function HomePage() {
                       onChange={() => setMode(value)}
                       className="h-4 w-4 accent-brand-600"
                     />
-                    <span>{value}</span>
+                    <span>{MODE_LABELS[value]}</span>
                   </label>
                 ))}
               </div>
@@ -162,7 +208,7 @@ export default function HomePage() {
                       onChange={() => setTone(value)}
                       className="h-4 w-4 accent-brand-600"
                     />
-                    <span>{value}</span>
+                    <span>{TONE_LABELS[value]}</span>
                   </label>
                 ))}
               </div>
@@ -178,11 +224,7 @@ export default function HomePage() {
             {loading ? '整形中...' : '整形を実行'}
           </button>
 
-          {error && (
-            <p className="mt-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
-              {error}
-            </p>
-          )}
+          {error && <p className="mt-4 rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{error}</p>}
         </article>
 
         <article className="relative rounded-3xl border border-slate-200 bg-white p-5 shadow-card md:p-6">
@@ -190,7 +232,7 @@ export default function HomePage() {
             <div>
               <h2 className="text-lg font-semibold text-slate-900">結果</h2>
               <p className="mt-1 text-xs text-slate-500">
-                used_llm: {usedLlm === null ? '-' : usedLlm ? 'true' : 'false'}
+                used_llm: {meta ? (meta.used_llm ? 'true' : 'false') : '-'} / model: {meta?.model_name || '-'}
               </p>
             </div>
             <button
@@ -203,14 +245,17 @@ export default function HomePage() {
             </button>
           </div>
 
-          <pre className="mt-4 min-h-[360px] overflow-auto whitespace-pre-wrap rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm leading-relaxed text-slate-800">
-            {result || 'ここに結果が表示されます。'}
-          </pre>
+          <pre className="mt-4 min-h-[260px] overflow-auto whitespace-pre-wrap rounded-2xl border border-slate-200 bg-slate-50 p-4 text-sm leading-relaxed text-slate-800">{result || 'ここに結果が表示されます。'}</pre>
+
+          <div className="mt-4 rounded-2xl border border-slate-200 bg-slate-50 p-3 text-xs text-slate-600">
+            <p>plan: {meta?.plan || limits?.plan || '-'}</p>
+            <p>monthly: {meta ? `${meta.monthly_used}/${meta.monthly_limit}` : limits ? `${limits.monthly_used}/${limits.monthly_limit}` : '-'}</p>
+            <p>remaining: {meta?.remaining ?? limits?.remaining ?? '-'}</p>
+            <p>max_input_chars: {meta?.max_input_chars ?? limits?.max_input_chars ?? '-'}</p>
+          </div>
 
           {copied && (
-            <div className="absolute right-6 top-16 rounded-lg bg-slate-900 px-3 py-2 text-xs text-white shadow-lg">
-              コピーしました
-            </div>
+            <div className="absolute right-6 top-16 rounded-lg bg-slate-900 px-3 py-2 text-xs text-white shadow-lg">コピーしました</div>
           )}
         </article>
       </section>
